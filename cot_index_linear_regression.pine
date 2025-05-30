@@ -1,0 +1,189 @@
+//@version=6
+//Inspiration from Larry Williams
+//Created by Dixon Chai
+
+import TradingView/LibraryCOT/2 as cotlib
+
+indicator('COT Index with 6-Month Forecast', overlay = false, max_lines_count = 500)
+
+// INPUTS
+i_dataSource = input.string('Futures Only', 'Data Source', ['Futures Only', 'Futures and Options'])
+i_showCom = input.bool(true, 'Show Commercials', group = 'Visibility')
+i_shownonCom = input.bool(false, 'Show Non-Commercials', group = 'Visibility')
+i_showRetailCom = input.bool(false, 'Show Retails', group = 'Visibility')
+
+// --- Forecast Toggle & Settings ---
+showForecastComponents = input.bool(true, 'Show 6M Forecast', group = 'Forecast Settings', tooltip = 'Toggle visibility of the 6-Month Commercial Index Linear Regression Forecast line and its associated background highlights.')
+regressionLength = input.int(10, 'Forecast Lookback Period', minval = 5, maxval = 50, group = 'Forecast Settings', tooltip = 'Number of past bars for the Linear Regression calculation on the 6-Month Commercial Index.')
+forecastOffset = input.int(2, 'Forecast Bars Forward', minval = 1, maxval = 5, group = 'Forecast Settings', tooltip = 'How many future bars to project the Linear Regression line.')
+showForecastHighlight = input.bool(true, 'Show Forecast Highlights', group = 'Forecast Settings', tooltip = 'Toggle visibility of the background highlights when forecast is significant.')
+forecastThreshold = input.float(3.0, 'Forecast Threshold %', minval = 0.1, maxval = 20.0, step = 0.5, group = 'Forecast Settings', tooltip = 'Percentage deviation from current regression for highlights (e.g., 3.0 means +/- 3%).')
+showBiasTable = input.bool(true, 'Show Bias Table', group = 'Forecast Settings', tooltip = 'Toggle visibility of the Projected Bias table.')
+
+// Determine CFTC code based on the root symbol
+cftc_code = cotlib.convertRootToCOTCode('Auto')
+if syminfo.root == 'HG'
+    cftc_code := '085692'
+    cftc_code
+else if syminfo.root == 'LBR'
+    cftc_code := '058644'
+    cftc_code
+
+// Data request function
+dataRequest(metricName, direction) =>
+    tickerId = cotlib.COTTickerid('Legacy', cftc_code, i_dataSource == 'Futures and Options', metricName, direction, 'All')
+    value = request.security(tickerId, '1W', close, ignore_invalid_symbol = true)
+    if barstate.islastconfirmedhistory and na(value)
+        runtime.error('Could not find relevant COT data based on the current symbol.')
+    value
+
+// Data fetching
+comLong = dataRequest('Commercial Positions', 'Long')
+comShort = dataRequest('Commercial Positions', 'Short')
+noncomLong = dataRequest('Noncommercial Positions', 'Long')
+noncomShort = dataRequest('Noncommercial Positions', 'Short')
+specLong = dataRequest('Nonreportable Positions', 'Long')
+specShort = dataRequest('Nonreportable Positions', 'Short')
+
+// Calculate net positions
+netCom = comLong - comShort
+netNoncom = noncomLong - noncomShort
+netSpec = specLong - specShort
+
+// Function to calculate commercial index
+calcCommercialIndex(net_positions, period) =>
+    lowestLow = ta.lowest(net_positions, period)
+    highestHigh = ta.highest(net_positions, period)
+    100 * (net_positions - lowestLow) / (highestHigh - lowestLow)
+
+// Calculate indices for 3 years (156 weeks), 12 months (52 weeks), and 6 months (26 weeks)
+index_3y = calcCommercialIndex(netCom, 156)
+index_12m = calcCommercialIndex(netCom, 52)
+index_6m = calcCommercialIndex(netCom, 26) // Our target for forecast
+
+// Plot commercial indices
+plot(i_showCom ? index_3y : na, title = 'Commercial Index 3-Year', color = color.yellow, linewidth = 1)
+plot(i_showCom ? index_12m : na, title = 'Commercial Index 12-Month', color = color.orange, linewidth = 1)
+plot(i_showCom ? index_6m : na, title = 'Commercial Index 6-Month', color = color.red, linewidth = 2)
+
+// --- Linear Regression Forecast Calculations for index_6m ---
+// Calculate the current linear regression line on the 6-month Commercial Index
+float regLine_6m = ta.linreg(index_6m, regressionLength, 0)
+
+// Calculate the forecasted value of the 6-month Commercial Index at the *projected future point*
+float futureForecastValue = ta.linreg(index_6m, regressionLength, -forecastOffset)
+
+// --- FORECAST LINE DRAWING (Corrected for Replay Mode and Type Errors) ---
+var line forecastLine = na
+var int forecastLineStartX = na
+var float forecastLineStartY = na
+var int forecastLineEndX = na
+var float forecastLineEndY = na
+var color forecastLineColor = na
+
+// We only want to set the line's fixed points ONCE, when we are on the *true* last historical bar
+// and the script is finished processing previous historical data.
+if barstate.islast
+    // Calculate the signal and line parameters for the final bar
+    bool isBullish = futureForecastValue > regLine_6m * (1 + forecastThreshold / 100)
+    bool isBearish = futureForecastValue < regLine_6m * (1 - forecastThreshold / 100)
+
+    forecastLineStartX := bar_index
+    forecastLineStartY := regLine_6m
+    forecastLineEndX := bar_index + forecastOffset
+
+    if isBullish
+        forecastLineEndY := math.max(futureForecastValue, regLine_6m * (1 + forecastThreshold / 100))
+        forecastLineColor := color.rgb(0, 255, 0) // Green for bullish forecast
+        forecastLineColor
+    else if isBearish
+        forecastLineEndY := math.min(futureForecastValue, regLine_6m * (1 - forecastThreshold / 100))
+        forecastLineColor := color.red // Red for bearish forecast
+        forecastLineColor
+    else
+        forecastLineEndY := futureForecastValue // Neutral forecast
+        forecastLineColor := color.rgb(128, 128, 128) // Gray for neutral
+        forecastLineColor
+
+    // Delete previous line if it exists
+    if na(forecastLine) == false
+        line.delete(forecastLine)
+
+    // Draw the new line
+    if showForecastComponents and not na(forecastLineStartX) and not na(forecastLineStartY) and not na(forecastLineEndX) and not na(forecastLineEndY)
+        forecastLine := line.new(x1 = forecastLineStartX, y1 = forecastLineStartY, x2 = forecastLineEndX, y2 = forecastLineEndY, color = forecastLineColor, width = 2, style = line.style_solid, extend = extend.right)
+        forecastLine
+    else if not showForecastComponents and not na(forecastLine) // If turned off, delete
+        line.delete(forecastLine)
+        forecastLine := na
+        forecastLine
+else if not showForecastComponents and not na(forecastLine) // Ensure line is deleted if toggled off mid-chart
+    line.delete(forecastLine)
+    forecastLine := na
+    forecastLine
+
+// --- Visual Highlight based on Forecast ---
+bool bullishForecastHighlight = futureForecastValue > regLine_6m * (1 + forecastThreshold / 100)
+bool bearishForecastHighlight = futureForecastValue < regLine_6m * (1 - forecastThreshold / 100)
+
+bgcolor(showForecastComponents and showForecastHighlight ? bullishForecastHighlight ? color.new(color.lime, 85) : bearishForecastHighlight ? color.new(color.red, 85) : na : na, title = 'Forecast Highlight')
+
+// --- Projected Bias Table ---
+var table biasTable = na
+
+if showBiasTable
+    if barstate.islast
+        // Delete existing table if it exists
+        if not na(biasTable)
+            table.delete(biasTable)
+
+        // Create new table
+        biasTable := table.new(position.bottom_right, 1, 2, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.white)
+
+        string biasText = 'Neutral'
+        color biasColor = color.gray
+        color biasBgColor = color.new(color.gray, 80)
+
+        if bullishForecastHighlight
+            biasText := 'Bullish'
+            biasColor := color.lime
+            biasBgColor := color.new(color.lime, 80)
+            biasBgColor
+        else if bearishForecastHighlight
+            biasText := 'Bearish'
+            biasColor := color.red
+            biasBgColor := color.new(color.red, 80)
+            biasBgColor
+
+        // Set table cells
+        table.cell(biasTable, 0, 0, 'Projected Bias', text_color = color.white, bgcolor = color.new(color.gray, 60), text_size = size.small)
+        table.cell(biasTable, 0, 1, biasText, text_color = color.white, bgcolor = biasBgColor, text_size = size.normal)
+else // Delete table if showBiasTable is disabled
+    if not na(biasTable)
+        table.delete(biasTable)
+        biasTable := na
+        biasTable
+
+// Calculate Non-commercial indices for 3 years (156 weeks), 12 months (52 weeks), and 6 months (26 weeks)
+indexnonc_3y = calcCommercialIndex(netNoncom, 156)
+indexnonc_12m = calcCommercialIndex(netNoncom, 52)
+indexnonc_6m = calcCommercialIndex(netNoncom, 26)
+
+// Plot Non-commercial indices if enabled
+plot(i_shownonCom ? indexnonc_3y : na, title = 'Non-Commercial Index 3-Year', color = color.aqua, linewidth = 1)
+plot(i_shownonCom ? indexnonc_12m : na, title = 'Non-Commercial Index 12-Month', color = color.blue, linewidth = 1)
+plot(i_shownonCom ? indexnonc_6m : na, title = 'Non-Commercial Index 6-Month', color = color.navy, linewidth = 1)
+
+// Calculate Retail indices for 3 years (156 weeks), 12 months (52 weeks), and 6 months (26 weeks)
+indexretail_3y = calcCommercialIndex(netSpec, 156)
+indexretail_12m = calcCommercialIndex(netSpec, 52)
+indexretail_6m = calcCommercialIndex(netSpec, 26)
+
+// Plot Retail indices if enabled
+plot(i_showRetailCom ? indexretail_3y : na, title = 'Retail Index 3-Year', color = color.white, linewidth = 1)
+plot(i_showRetailCom ? indexretail_12m : na, title = 'Retail Index 12-Month', color = color.silver, linewidth = 1)
+plot(i_showRetailCom ? indexretail_6m : na, title = 'Retail Index 6-Month', color = color.gray, linewidth = 1)
+
+// Plot horizontal lines at 25 and 75
+hline(25, '25 Level', color = color.gray, linestyle = hline.style_dotted)
+hline(75, '75 Level', color = color.gray, linestyle = hline.style_dotted)
