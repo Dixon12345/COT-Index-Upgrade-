@@ -1,1 +1,1 @@
-# COT-Index-Upgrade-
+#  COT Index + Linear Regression
